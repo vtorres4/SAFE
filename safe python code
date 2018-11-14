@@ -1,0 +1,305 @@
+#
+# SAFE UAS Experiment 3D Stereo
+#
+#
+import subprocess
+import os, os.path, sys, glob, click, sched, threading
+import datetime, time, signal
+
+import Queue
+
+import logging
+import gi
+import tis
+import cv2
+
+gi.require_version("Tcam", "0.1")
+gi.require_version("Gst", "1.0")
+
+from gi.repository import Tcam, Gst
+
+mydir       = "pdata"
+device      = "/dev/sda1"
+mntpnt      = "/mnt"
+width       = 640
+height      = 480
+
+#frame rate
+numerator   = 60
+denominator = 1
+cameras     = []
+
+viewerQueue = Queue.Queue(1000)
+filerQueue  = Queue.Queue(1000)
+
+FINISHED    = False
+
+#
+# Find Cameras connected to USB
+#
+def get_camera_serials(verbose):
+
+    source = Gst.ElementFactory.make("tcambin")
+
+    serials = source.get_device_serials()
+
+    camera_serials = []
+    
+    for single_serial in serials:
+
+        # This returns someting like:
+        # (True, name='DFK Z12GP031',
+        # identifier='The Imaging Source Europe GmbH-11410533', connection_type='aravis')
+        # The identifier is the name given by the backend
+        # The connection_type identifies the backend that is used.
+        #     Currently 'aravis', 'v4l2' and 'unknown' exist
+        (return_value, model,
+         identifier, connection_type) = source.get_device_info(single_serial)
+
+        # return value would be False when a non-existant serial is used
+        # since we are iterating get_device_serials this should not happen
+        if return_value:
+            if verbose:
+                print("Found Camera Model: {} Serial: {} Type: {}".format(model,
+                                                         single_serial,
+                                                         connection_type))
+            camera_serials.append(single_serial)
+    
+    return camera_serials
+
+def initCameras(verbose):
+    print ("initCameras", verbose)
+    cameras_serials = get_camera_serials(verbose)    
+    if len(cameras_serials) == 0:
+        raise ("Cannot find cameras")
+
+    if verbose:
+        print ("found cameras:", cameras_serials)
+        
+    for serial in cameras_serials:
+        cam  = tis.TIS(serial, width, height, numerator, denominator, False, verbose)
+        cameras.append(
+        {   'cam': cam,
+            'serial': serial })
+    
+        # Query the gain auto and current value :
+        if verbose:
+            print("Gain Auto : %s " % cam.Get_Property("Gain Auto").value)
+            print("Gain : %d" % cam.Get_Property("Gain").value)
+            print("Exposure : %d" % cam.Get_Property("Exposure").value)
+
+        cv2.namedWindow(serial, 1)
+
+        cam.Start_pipeline()
+        
+        if verbose:
+            print ("Pipeline started for {}".format(serial))
+#                                            
+# Check USB dongle is mounted
+#
+def dataDir(folder):
+    """:return: True if the device is mounted at the correct mount point
+                False if the device is not mounted
+                raises a RuntimeError if the device is mounted at the wrong
+                mount point"""
+    
+    # PGC fixed for running server on local machine
+    #if not os.path.exists('/proc/mounts'):
+    #    return False
+
+    with open('/proc/mounts', 'r') as mnt:
+        for line in mnt.readlines():
+            fields = line.split()
+            #print fields
+            if fields[0] == device:
+                print(fields[1], mydir, folder)
+                dataDir = os.path.join(fields[1], mydir, folder)
+                
+                if not os.path.exists(dataDir):
+                    os.makedirs(dataDir)
+                    #raise RuntimeError, "Could not find dataDir {} on device {}".format(dataDir, device)
+                
+                return dataDir
+                
+    raise OSError; print ( "Cannot read /proc/mounts")
+
+class CameraThread(threading.Thread):
+    def __init__(self, serial, cam, dataDir, viewer_q, filer_q, verbose):
+        threading.Thread.__init__(self)
+        self.threadID   = serial
+        self.serial     = serial
+        self.cam        = cam
+        self.viewer_q   = viewer_q
+        self.filer_q    = filer_q
+        self.imgDir     = os.path.join(dataDir, serial)
+        self.verbose    = verbose
+        
+        if not os.path.exists(self.imgDir):
+            os.makedirs(self.imgDir)
+        
+    def run(self):
+        image   = self.cam.Get_image()
+        if image is not  None :
+            error = 0
+            
+            data = {
+                'serial':   self.serial,
+                'ts':       datetime.datetime.now(),
+                'image':    image
+            }
+            
+            self.viewer_q.put(data)
+            self.filer_q.put(data)
+            
+        else:
+            print ("*** Error retrieving img for {}".format(self.serial))
+
+# 
+# Grab from queue and view it on screen
+#          
+class Viewer(threading.Thread):
+    def __init__(self, q, verbose):
+        threading.Thread.__init__(self)
+        self.q          = q
+        self.verbose    = verbose
+    
+    def run(self):
+        while not FINISHED:
+            task = self.q.get()
+            serial = task['serial']
+            img    = task['image']
+            
+            if self.verbose:
+                print ("view", serial)
+            cv2.imshow(serial, img)
+            cv2.waitKey(1)
+        
+        print ("Viewer ended.")
+            
+# 
+# Grab from queue and save it on disk
+#
+class Filer(threading.Thread):
+  def __init__(self, dataDir, q, fmt, verbose):
+      threading.Thread.__init__(self)
+      self.q         = q
+      self.dataDir   = dataDir
+      self.fmt       = fmt
+      self.verbose   = verbose
+
+  def run(self):
+      while not FINISHED:
+          task = self.q.get()
+          serial = task['serial']
+          img    = task['image']
+          ts     = task['ts']
+          fileName = os.path.join(self.dataDir,serial, "{}-{}.{}".format(serial, ts.strftime("%Y%m%d-%H%M%S-%f"), self.fmt))
+          
+          if self.verbose:
+              print ("saving {}...".format(fileName))
+
+          options = []
+          if self.fmt == 'png':
+              options = [cv2.IMWRITE_PNG_COMPRESSION, 0]
+          elif self.fmt == 'jpg':
+              options = [cv2.IMWRITE_JPEG_QUALITY, 100]
+              
+          cv2.imwrite(fileName , img, options)
+     
+      print ("Filer ended.")
+            
+#
+# Scheduler
+#
+class PeriodicScheduler(object):                                                  
+    def __init__(self):                                                           
+        self.scheduler  = sched.scheduler(time.time, time.sleep)                   
+        self.running    = False 
+                                                                            
+    def setup(self, interval, action, actionargs=()):                             
+        action(*actionargs)                                                       
+        self.event = self.scheduler.enter(interval, 1, self.setup,(interval, action, actionargs))                           
+                                                                        
+    def run(self):      
+        self.running = True                                                          
+        self.scheduler.run()
+
+    def cancel(self):
+        self.running = False
+        if self.event:
+            print ("Canceling scheduler event...")
+            self.scheduler.cancel(self.event)
+
+  
+periodic_scheduler = PeriodicScheduler()  
+
+# Trapping ctrl-c and kill gpsp (GpsPoller)
+def signal_handler(signal, frame):
+    print('Signal Handler Terminating...!')
+    FINISHED = True
+    cv2.destroyAllWindows()
+    periodic_scheduler.cancel()
+    sys.exit(0)
+
+#
+# Does not seem to be working right
+#   
+#signal.signal(signal.SIGINT, signal_handler)
+#signal.signal(signal.SIGTERM, signal_handler)
+      
+@click.command()
+@click.option('-f', '--folder')
+@click.option('-i', '--interval')
+@click.option('-v', '--verbose')
+
+def main(folder, interval, verbose):
+    # make sure that the USB stick is mounted and datadir is available
+    mydir = dataDir(folder)
+    if verbose:
+        print ("dataDir:", mydir, verbose)
+        
+    Gst.init()
+
+    initCameras(verbose)
+    cv2.waitKey(1)
+    
+    viewer = Viewer(viewerQueue, verbose)
+    viewer.start()
+
+    filer = Filer(mydir, filerQueue, 'png', verbose)
+    filer.start()
+    
+    # This is the event to execute every time  
+    def periodic_event():  
+        startTime = datetime.datetime.now()
+        print ("Imaging {}...".format(startTime.isoformat()))
+
+        threads = []
+
+        for c in cameras:
+            thread  = CameraThread(c['serial'], c['cam'], mydir, viewerQueue, filerQueue, verbose)
+            thread.start()
+            threads.append(thread)
+
+        for t in threads:
+            t.join()
+    
+    intervalValue = float(interval)
+    #if intervalValue < 0.5 or intervalValue > 2:
+    #    print "Invalid interval in seconds: {}".format(intervalValue)
+        
+    if verbose:
+        print ("interval {0} seconds".format(intervalValue))
+
+    periodic_scheduler.setup(intervalValue, periodic_event) # it executes the event just once  
+    periodic_scheduler.run() # it starts the scheduler
+    
+    for c in cameras:
+        cam = c['cam']
+        cam.Stop_pipeline()
+        
+    print('Program ended')
+    
+# python safe.py --folder test1 --interval 2
+if __name__ == '__main__':
+	main() 
